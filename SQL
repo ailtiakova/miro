@@ -1,0 +1,228 @@
+-- Following code is for Task 3 Analysis. Different CTE's produce summary tables for different graphs.
+-- join eventstream data.
+
+WITH events as(
+SELECT * FROM (
+(SELECT user_id,time,click_upgrade_from, null as locked_feature_name,'click_upgrade' as event FROM  `clear-heaven-138623.miro_task.click_upgrade`)
+UNION ALL
+(SELECT user_id,time,null as click_upgrade_from, null as locked_feature_name,'show_inapp_pricing' as event FROM `clear-heaven-138623.miro_task.show_inapp_pricing`)
+UNION ALL
+(SELECT user_id,time,null as click_upgrade_from,null as locked_feature_name,'subscription_created' as event FROM `clear-heaven-138623.miro_task.subscription_created`)
+UNION ALL 
+(SELECT user_id,time,null as click_upgrade_from,locked_feature_name,'clicked_locked_feature'as event FROM `clear-heaven-138623.miro_task.clicked_locked_feature`)
+UNION ALL
+(SELECT user_id,time,null as click_upgrade_from,null as locked_feature_name,'viewed_payment_details'as event FROM `clear-heaven-138623.miro_task.viewed_payment_details`)
+)),
+-- add account data.
+account_data as (
+SELECT ac.*, 
+a.* 
+FROM events ac
+JOIN `clear-heaven-138623.miro_task.accounts` a
+ON ac.user_id = a.creator_id
+),
+
+--add converted flag. 
+add_sub_flag as( 
+SELECT *,
+IF (COUNTIF(event = 'subscription_created') OVER (PARTITION BY user_id ORDER BY time ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) > 0 ,TRUE, FALSE) as converted_flag,
+IF (COUNTIF(event = 'clicked_locked_feature') OVER (PARTITION BY user_id ORDER BY time ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) > 0 ,TRUE, FALSE) as locked_feature_seen_flag
+FROM account_data
+ORDER BY user_id, time ASC), 
+
+--add upgrade type flag. Made assumptioned about what is a locked feature and what is not based on the UI.
+
+add_upgrade_type as( 
+SELECT *,
+CASE 
+    WHEN click_upgrade_from IN ('hi_res_export','create_project','Features_popup','backup_board','over_boards_limit_popup','Private_board_popup','create_template_board','create_template','custom_template_tip','over_boards_limit_banner_board','create_teamplate_widget','over_boards_limit_banner','jira_addon','team_paused_banner_dashboard','Board cannot be created','private_board_locked', 'board_locked_by_limits_exceeded') THEN 'locked feature'
+    WHEN click_upgrade_from IN ('dashboard_toolbar','dashboard menu','shareable_link','sharing_dialog','dashboard_invite_window','settings_non-team_users','settings_sharing_settings','team_settings_billing') THEN 'other'
+    ELSE click_upgrade_from END as upgrade_from_bucket,
+CASE WHEN event = 'clicked_locked_feature' OR 'click_upgrade_from' IN ('hi_res_export','create_project','Features_popup','backup_board','over_boards_limit_popup','Private_board_popup','create_template_board','create_template','custom_template_tip','over_boards_limit_banner_board','create_teamplate_widget','over_boards_limit_banner','jira_addon','team_paused_banner_dashboard','Board cannot be created','private_board_locked', 'board_locked_by_limits_exceeded') THEN 1 
+    WHEN event = 'click_upgrade' THEN 2
+    WHEN event = 'show_inapp_pricing' THEN 3 
+    WHEN event = 'viewed_payment_details' THEN 4
+    WHEN event = 'subscription_created' THEN 5 END as step --used the work out which was the earliest step in the journey users started from.
+FROM add_sub_flag
+ORDER BY user_id, time ASC), 
+
+step_group as (
+    SELECT *,
+    MIN(step) OVER (PARTITION BY user_id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as earliest_step_seen
+    FROM add_upgrade_type
+),
+
+--link subscription events to click_upgrade_from source for attribution
+upgrade_seed as(
+SELECT *,
+IF(event = "click_upgrade",CONCAT(user_id,"-",UNIX_SECONDS(time)),NULL) AS upgrade_seed_id
+FROM step_group
+),
+upgrade_attempt as(
+SELECT *,
+IF(event != "clicked_locked_feature",LAST_VALUE(upgrade_seed_id IGNORE NULLS) OVER (PARTITION BY user_id ORDER BY time ASC),NULL) as upgrade_attempt_id
+FROM upgrade_seed
+),
+
+attempt_converted as(
+    SELECT *,
+IF(COUNTIF(event = 'subscription_created') OVER (PARTITION BY user_id,upgrade_attempt_id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) > 0 ,TRUE, FALSE) as attempt_conv
+FROM upgrade_attempt
+ORDER BY user_id, time
+),
+-- to calculate the different locked features by user, depth of features triggered
+distinct_locked_features_array as (
+    SELECT *,
+    ARRAY_AGG(CASE WHEN locked_feature_name IS NULL THEN '' ELSE locked_feature_name END) OVER (PARTITION BY user_id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as diff_features_raw
+     FROM attempt_converted
+),
+
+distinct_locked_features as (
+    SELECT *
+    EXCEPT(diff_features_raw),
+    (SELECT COUNT(t.v) FROM (SELECT DISTINCT  * FROM UNNEST (diff_features_raw) as v WHERE v != '' ORDER BY v ASC) t) as diff_features
+     FROM distinct_locked_features_array
+     WHERE time BETWEEN '2019-02-01 00:00:00' AND '2019-05-31 23:59:00 UTC'
+),
+
+---cohort 
+cohort_input as (
+    SELECT *,
+    MIN(time) OVER (PARTITION BY user_id ORDER BY time ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as acquisition_time
+    FROM 
+    distinct_locked_features
+),
+-- for plotting cohorts. Did some manipulating of dates that fell within the same day and were not being included in the count initially.This would need some further verification and refinement.
+cohort_output as (
+    SELECT * , 
+#    DATE_DIFF(DATE(time),DATE(acquisition_time),week) weeks_from_acquisition,
+CAST(CASE WHEN TIMESTAMP_DIFF(TIMESTAMP(time),TIMESTAMP(acquisition_time),SECOND) <604800 THEN 1 ELSE TIMESTAMP_DIFF(TIMESTAMP(time),TIMESTAMP(acquisition_time),SECOND)/(60*60*24*7) END AS INT64) weeks_from_acquisition
+    FROM cohort_input
+),
+
+--add buckets, non-aggregated 
+buckets as (
+    SELECT *, 
+    CASE WHEN company_size IN('51 - 250','51 - 500','251 - 500') THEN '51 - 500' ELSE company_size END as company_size_groups,
+    CASE WHEN members = 1 THEN '1'
+     WHEN members >1 and members <=5 THEN '2-5'
+     WHEN members >5 and members <=10 THEN '6-10'
+     WHEN members > 10 THEN '>10' ELSE NULL END as members_buckets,
+    CASE WHEN seats = 1 THEN '1'
+     WHEN seats >1 and seats <=5 THEN '2-5'
+     WHEN seats >5 and seats <=10 THEN '6-10'
+     WHEN seats > 10 THEN '>10' ELSE NULL END as seats_buckets,
+    FROM cohort_output
+    WHERE time BETWEEN '2019-02-01 00:00:00' AND '2019-05-31 23:59:00 UTC' -- 4 months of data
+),
+-- plotting the lifecycle cohort graphs
+cohort_summary as (
+    SELECT 
+    weeks_from_acquisition,
+    converted_flag,
+    company_size_groups,
+    members_buckets,
+    count(DISTINCT user_id) users,
+    COUNTIF(event = 'subscription_created') subscriptions_events,
+    COUNT(DISTINCT CASE WHEN event ='clicked_locked_feature'THEN user_id END) as locked_feature_users,
+    COUNTIF(event = 'clicked_locked_feature') locked_feature_events,
+    COUNT(DISTINCT CASE WHEN event ='click_upgrade'THEN user_id END) as upgrade_attempt_users,
+    COUNTIF(event = 'click_upgrade') upgrade_attempt_events,
+    COUNT(DISTINCT CASE WHEN event ='show_inapp_pricing'THEN user_id END) as show_pricing_users,
+    COUNTIF(event = 'show_inapp_pricing') show_pricing_events,
+    COUNT(DISTINCT CASE WHEN event ='viewed_payment_details'THEN user_id END) as view_payment_details_users,
+    COUNTIF(event = 'viewed_payment_details') view_payment_details_events,
+    FROM buckets 
+    GROUP BY 1,2,3,4
+),
+-- for calculative time to steps view
+user_summary_time as(
+    SELECT user_id, 
+    created_at, 
+    status,
+    company_size_groups,
+    members_buckets,
+    seats_buckets,
+    MIN(CASE WHEN event = 'clicked_locked_feature' THEN time END) as first_click_locked_feature_time,
+    MIN(CASE WHEN event = 'click_upgrade' THEN time END) as first_click_upgrade_time,
+    MIN(CASE WHEN event = 'show_inapp_pricing' THEN time END) as first_show_inapp_pricing,
+    MIN(CASE WHEN event = 'viewed_payment_details' THEN time END) as first_view_payment_time,
+    MIN(CASE WHEN event = 'subscription_created' THEN time END) as subscription_created_time
+    FROM buckets
+    GROUP BY 1,2,3,4,5,6
+),
+--filtered out negative times to simplify analysis. Needs further refinementto be accurate. Noticed users who had events before their account created date, may be a result of multiple accounts. 
+user_summary_time_calc as (
+    SELECT
+    user_id, 
+    created_at, 
+    status,
+    company_size_groups,
+    members_buckets,
+    seats_buckets,
+    CASE WHEN DATE_DIFF(subscription_created_time,created_at,day)>=0 THEN DATE_DIFF(subscription_created_time,created_at,day) ELSE NULL END as days_to_convert,
+    CASE WHEN DATE_DIFF(first_click_locked_feature_time,created_at,day)>=0 THEN DATE_DIFF(first_click_locked_feature_time,created_at,day) ELSE NULL END as days_to_first_locked_feature,
+    CASE WHEN DATE_DIFF(first_click_upgrade_time,created_at,day)>=0 THEN DATE_DIFF(first_click_upgrade_time,created_at,day) ELSE NULL END as days_to_first_upgrade_attempt,
+    #CASE WHEN TIMESTAMP_DIFF(TIMESTAMP(first_click_upgrade_time),TIMESTAMP(created_at),SECOND)/(60*60*24)>=0 THEN TIMESTAMP_DIFF(TIMESTAMP(first_click_upgrade_time),TIMESTAMP(created_at),SECOND)/(60*60*24) ELSE NULL END as days_to_first_locked_feature,
+    CASE WHEN DATE_DIFF(first_show_inapp_pricing,first_click_upgrade_time,day)>=0 THEN DATE_DIFF(first_show_inapp_pricing,first_click_upgrade_time,day) ELSE NULL END as days_to_view_pricing_from_upgrade,
+    CASE WHEN DATE_DIFF(first_view_payment_time,first_show_inapp_pricing,day)>=0 THEN DATE_DIFF(first_view_payment_time,first_show_inapp_pricing,day) ELSE NULL END as days_to_first_view_payment_from_pricing,
+    CASE WHEN DATE_DIFF(subscription_created_time,first_view_payment_time,day)>=0 THEN DATE_DIFF(subscription_created_time,first_view_payment_time,day) ELSE NULL END as days_from_pricing_to_subscribing
+    FROM user_summary_time
+    GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12
+),
+
+-- master table for majority of funnel analysis 
+summary as(
+SELECT
+EXTRACT(YEAR FROM DATE(time)) as year,
+company_size_groups,
+members_buckets,
+status,
+first_plan, 
+last_plan,
+seats_buckets,
+converted_flag,
+earliest_step_seen,
+diff_features, -- different locked features by user 
+COUNT(DISTINCT CASE WHEN event = 'clicked_locked_feature' THEN user_id END) AS locked_feature_users, 
+COUNT(DISTINCT CASE WHEN event = 'click_upgrade' THEN user_id END) AS click_upgrade_users,
+COUNT(DISTINCT CASE WHEN event = 'show_inapp_pricing' THEN user_id END) AS show_inapp_pricing_users, 
+COUNT(DISTINCT CASE WHEN event = 'viewed_payment_details' THEN user_id END) AS viewed_payment_details_users,
+COUNT(DISTINCT CASE WHEN event = 'subscription_created' THEN user_id END) AS subscription_created_users,
+COUNTIF(event = 'clicked_locked_feature') as clicked_locked_feature_events, 
+COUNTIF(event = 'click_upgrade') as click_upgrade_events, 
+COUNTIF(event = 'show_inapp_pricing') as show_inapp_pricing_events, 
+COUNTIF(event = 'viewed_payment_details') as viewed_payment_details_events,
+COUNTIF(event = 'subscription_created') as subscription_created_events, 
+COUNT(DISTINCT user_id) as user_count
+FROM buckets
+GROUP BY 1,2,3,4,5,6,7,8,9,10),
+
+--generated upgraded from graph
+upgrade_summary as(
+    SELECT 
+    DATE_TRUNC(DATE(time),year) as year,
+    click_upgrade_from,
+    upgrade_from_bucket,
+    COUNT(upgrade_attempt_id) as attempts,
+    COUNTIF(attempt_conv = TRUE) as converted_attempts
+    FROM buckets
+    WHERE event = 'click_upgrade'
+    GROUP BY 1,2,3
+),
+--generated locked featues breakdown graph
+locked_feature_breakdown as (
+    SELECT
+    DATE_TRUNC(DATE(time),year) as year,
+    locked_feature_name, 
+    COUNT(event = 'clicked_locked_feature') as event,
+    COUNT(DISTINCT CASE WHEN event = 'clicked_locked_feature' THEN user_id END) AS locked_feature_users
+    FROM buckets
+    WHERE event = 'clicked_locked_feature'
+    GROUP BY 1,2
+)
+
+
+SELECT * FROM summary
+
+
